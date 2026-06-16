@@ -9,6 +9,11 @@ name: build
 #
 # Used directly (workflow_dispatch, on-demand for any ref) and via workflow_call
 # from sync.yml (tags since v2.00 + master).
+#
+# Release ordering: GitHub sorts the Releases page by each tag's commit date, so the
+# `release` job tags an EMPTY commit dated at the SGDK ref's commit time and creates
+# the release; build/docs jobs only upload assets to it. This keeps releases sorted
+# chronologically and lets GitHub auto-pick the newest as "Latest".
 
 on:
   workflow_dispatch:
@@ -33,8 +38,35 @@ env:
   SJASM_VERSION: "v0.39"
 
 jobs:
+  release:
+    name: create dated release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create release tagged at the SGDK commit date
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # date of the SGDK commit this ref points to (ISO 8601, git-acceptable)
+          SGDK_DATE="$(gh api "repos/${SGDK_REPO}/commits/${{ inputs.sgdk_ref }}" --jq '.commit.committer.date')"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          empty="$(git hash-object -t tree /dev/null)"
+          # empty commit dated at the upstream commit time -> Releases page sorts chronologically
+          c="$(GIT_AUTHOR_DATE="$SGDK_DATE" GIT_COMMITTER_DATE="$SGDK_DATE" git commit-tree "$empty" -m "${{ inputs.release_tag }}")"
+          git tag -f "${{ inputs.release_tag }}" "$c"
+          git push -f origin "refs/tags/${{ inputs.release_tag }}"
+          if ! gh release view "${{ inputs.release_tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "${{ inputs.release_tag }}" --repo "$GITHUB_REPOSITORY" \
+              --title "SGDK ${{ inputs.release_tag }}" \
+              --notes "Native SGDK build — upstream ref \`${{ inputs.sgdk_ref }}\` ($SGDK_DATE)."
+          fi
+
   build:
     name: ${{ matrix.name }}
+    needs: release
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     strategy:
@@ -143,11 +175,10 @@ jobs:
           name: sgdk-${{ matrix.name }}
           path: ${{ steps.pkg.outputs.asset }}
 
-      - name: Publish to release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.release_tag }}
-          files: ${{ steps.pkg.outputs.asset }}
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.release_tag }}" "${{ steps.pkg.outputs.asset }}" --clobber --repo "${{ github.repository }}"
 
   # Docs are platform-independent: generate ONCE and ship as a separate asset
   # (sgdkx downloads it instead of running doxygen locally). Recipe mirrors sgdkx's
@@ -155,6 +186,7 @@ jobs:
   # and run doxygen from the PARENT of SGDK so the config's INPUT = ./SGDK/... resolves.
   docs:
     name: docs
+    needs: release
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -201,9 +233,8 @@ jobs:
           name: sgdk-docs
           path: ${{ steps.pkg.outputs.asset }}
 
-      - name: Publish to release
+      - name: Upload to release
         if: steps.pkg.outputs.asset != ''
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ inputs.release_tag }}
-          files: ${{ steps.pkg.outputs.asset }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ inputs.release_tag }}" "${{ steps.pkg.outputs.asset }}" --clobber --repo "${{ github.repository }}"
