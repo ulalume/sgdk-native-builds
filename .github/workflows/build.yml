@@ -1,0 +1,158 @@
+name: build
+
+# Build a single SGDK ref into a self-contained, native distribution for each
+# platform: native SGDK tools (xgmtool/bintos/convsym/sjasm) + mac68k + libmd.a /
+# libmd_debug.a, built against the prebuilt gcc 13 toolchain (NOT rebuilt here).
+#
+# Building logic mirrors sgdk-setup.sh (build_sgdktools + makelib.gen). The gcc
+# toolchain and mac68k are downloaded from their own release repos and composed in.
+#
+# Used directly (workflow_dispatch, on-demand for any ref) and via workflow_call
+# from sync.yml (tags since v2.00 + master).
+
+on:
+  workflow_dispatch:
+    inputs:
+      sgdk_ref:    { description: "SGDK git ref (tag / branch / SHA)", required: true, default: "master" }
+      release_tag: { description: "Release tag to publish in THIS repo", required: true }
+  workflow_call:
+    inputs:
+      sgdk_ref:    { type: string, required: true }
+      release_tag: { type: string, required: true }
+
+permissions:
+  contents: write
+
+env:
+  GCC_VERSION: "13.2.0"
+  TOOLCHAIN_REPO: "ulalume/m68k-toolchain-builds"
+  TOOLCHAIN_TAG: "gcc13.2.0-1"        # m68k-toolchain-builds release providing the gcc 13 toolchain
+  MACCER_REPO: "ulalume/maccer"
+  MACCER_TAG: "v0.26-1"
+  SGDK_REPO: "Stephane-D/SGDK"
+  SJASM_VERSION: "v0.39"
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: linux-x86_64, runner: ubuntu-latest,    os: linux }
+          - { name: linux-arm64,  runner: ubuntu-24.04-arm, os: linux }
+          - { name: macos-arm64,  runner: macos-14,         os: macos }
+          - { name: macos-x86_64, runner: macos-15-intel,   os: macos }
+
+    steps:
+      - name: Install host build deps
+        shell: bash
+        run: |
+          set -ex
+          if [ "${{ matrix.os }}" = linux ]; then
+            sudo apt-get update
+            sudo apt-get install -y build-essential make doxygen
+          else
+            brew install make doxygen || true
+          fi
+
+      - name: Fetch prebuilt gcc toolchain + mac68k
+        shell: bash
+        run: |
+          set -ex
+          P="${{ matrix.name }}"
+          curl -fSL -o toolchain.tar.gz \
+            "https://github.com/${TOOLCHAIN_REPO}/releases/download/${TOOLCHAIN_TAG}/m68k-elf-toolchain-gcc${GCC_VERSION}-${P}.tar.gz"
+          tar xf toolchain.tar.gz          # -> m68k-elf-toolchain/
+          curl -fSL -o maccer.tar.gz \
+            "https://github.com/${MACCER_REPO}/releases/download/${MACCER_TAG}/mac68k-${P}.tar.gz"
+          tar xf maccer.tar.gz             # -> mac68k-<platform>/mac68k
+          "$PWD/m68k-elf-toolchain/bin/m68k-elf-gcc" --version
+
+      - name: Checkout SGDK at ref
+        shell: bash
+        run: |
+          set -ex
+          git clone "https://github.com/${SGDK_REPO}.git" SGDK
+          cd SGDK
+          git checkout "${{ inputs.sgdk_ref }}"
+          git rev-parse HEAD
+
+      - name: Build native SGDK tools (sjasm / xgmtool / bintos / convsym) + mac68k
+        shell: bash
+        run: |
+          set -ex
+          ROOT="$PWD"
+          GDK="$ROOT/SGDK"
+          if [ "${{ matrix.os }}" = macos ]; then JOBS="$(sysctl -n hw.ncpu)"; else JOBS="$(nproc)"; fi
+
+          # sjasm (Konamiman) — host C++ build
+          git clone https://github.com/Konamiman/Sjasm "$ROOT/Sjasm"
+          cd "$ROOT/Sjasm" && git checkout "${SJASM_VERSION}" && cd Sjasm
+          make clean || true
+          if [ "${{ matrix.os }}" = macos ]; then export CC=/usr/bin/gcc CXX=/usr/bin/g++; fi
+          make sjasm -j"$JOBS"
+          cp sjasm "$GDK/bin/sjasm"
+
+          # xgmtool / bintos (host C)
+          cd "$GDK/tools/xgmtool" && gcc src/*.c -Wall -O2 -lm -o xgmtool && cp xgmtool "$GDK/bin/"
+          cd "$GDK/tools/bintos"  && gcc src/bintos.c -Wall -O2 -o bintos && cp bintos "$GDK/bin/"
+          # convsym (its own Makefile)
+          cd "$GDK/tools/convsym" && make -j"$JOBS" && cp build/convsym "$GDK/bin/"
+
+          # mac68k (prebuilt, for .asm projects)
+          cp "$ROOT/mac68k-${{ matrix.name }}/mac68k" "$GDK/bin/mac68k"
+          chmod +x "$GDK/bin/mac68k"
+
+      - name: Build libmd.a (release + debug)
+        shell: bash
+        run: |
+          set -ex
+          ROOT="$PWD"
+          export PATH="$ROOT/SGDK/bin:$ROOT/m68k-elf-toolchain/bin:$PATH"
+          cd "$ROOT/SGDK"
+          make -f makelib.gen clean-release
+          make -f makelib.gen release
+          make -f makelib.gen clean-debug
+          make -f makelib.gen debug
+          ls -l lib/
+
+      - name: Generate docs (best-effort, server-side doxygen)
+        shell: bash
+        run: |
+          set -ex
+          cd "$PWD/SGDK"
+          DOXY="$(find . -maxdepth 3 -iname 'Doxyfile*' | head -1 || true)"
+          if [ -n "$DOXY" ] && command -v doxygen >/dev/null; then
+            ( cd "$(dirname "$DOXY")" && doxygen "$(basename "$DOXY")" ) || echo "doxygen failed (non-fatal)"
+          else
+            echo "no Doxyfile / doxygen — skipping docs"
+          fi
+
+      - name: Package self-contained SGDK
+        id: pkg
+        shell: bash
+        run: |
+          set -ex
+          GDK="$PWD/SGDK"
+          # drop VCS + Windows-only binaries (native unix distro); keep jars + native tools
+          rm -rf "$GDK/.git"
+          find "$GDK/bin" -type f \( -name '*.exe' -o -name '*.dll' \) -delete || true
+          ASSET="sgdk-${{ inputs.release_tag }}-${{ matrix.name }}.tar.gz"
+          tar czf "$ASSET" -C "$PWD" SGDK
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          ls -lh "$ASSET"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sgdk-${{ matrix.name }}
+          path: ${{ steps.pkg.outputs.asset }}
+
+      - name: Publish to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: ${{ steps.pkg.outputs.asset }}

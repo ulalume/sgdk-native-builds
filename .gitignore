@@ -1,0 +1,9 @@
+# fetched sources / build outputs
+SGDK/
+Sjasm/
+m68k-elf-toolchain/
+mac68k-*/
+*.tar.gz
+*.tar.xz
+*.zip
+.DS_Store
