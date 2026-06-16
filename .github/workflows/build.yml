@@ -113,9 +113,13 @@ jobs:
           ROOT="$PWD"
           export PATH="$ROOT/SGDK/bin:$ROOT/m68k-elf-toolchain/bin:$PATH"
           cd "$ROOT/SGDK"
-          make -f makelib.gen clean-release
+          # Version-agnostic: SGDK versions differ in clean target names
+          # (clean-release vs cleanrelease) AND object placement (out/<type>/ vs
+          # next to sources). So: build release, then wipe build artifacts with git
+          # (keeping the built tools in bin/ and the release lib in lib/), then build
+          # debug so its objects are recompiled with debug flags.
           make -f makelib.gen release
-          make -f makelib.gen clean-debug
+          git clean -fdx -e /bin -e /lib
           make -f makelib.gen debug
           ls -l lib/
 
