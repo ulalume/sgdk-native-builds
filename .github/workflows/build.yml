@@ -53,9 +53,9 @@ jobs:
           set -ex
           if [ "${{ matrix.os }}" = linux ]; then
             sudo apt-get update
-            sudo apt-get install -y build-essential make doxygen
+            sudo apt-get install -y build-essential make
           else
-            brew install make doxygen || true
+            brew install make || true
           fi
 
       - name: Fetch prebuilt gcc toolchain + mac68k
@@ -123,18 +123,6 @@ jobs:
           make -f makelib.gen debug
           ls -l lib/
 
-      - name: Generate docs (best-effort, server-side doxygen)
-        shell: bash
-        run: |
-          set -ex
-          cd "$PWD/SGDK"
-          DOXY="$(find . -maxdepth 3 -iname 'Doxyfile*' | head -1 || true)"
-          if [ -n "$DOXY" ] && command -v doxygen >/dev/null; then
-            ( cd "$(dirname "$DOXY")" && doxygen "$(basename "$DOXY")" ) || echo "doxygen failed (non-fatal)"
-          else
-            echo "no Doxyfile / doxygen — skipping docs"
-          fi
-
       - name: Package self-contained SGDK
         id: pkg
         shell: bash
@@ -156,6 +144,65 @@ jobs:
           path: ${{ steps.pkg.outputs.asset }}
 
       - name: Publish to release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          files: ${{ steps.pkg.outputs.asset }}
+
+  # Docs are platform-independent: generate ONCE and ship as a separate asset
+  # (sgdkx downloads it instead of running doxygen locally). Recipe mirrors sgdkx's
+  # generate_sgdk_doc (src/commands/setup.rs): rewrite OUTPUT_DIRECTORY to ./SGDK/doc
+  # and run doxygen from the PARENT of SGDK so the config's INPUT = ./SGDK/... resolves.
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Install doxygen
+        run: sudo apt-get update && sudo apt-get install -y doxygen graphviz
+
+      - name: Checkout SGDK at ref (must be a dir named 'SGDK')
+        shell: bash
+        run: |
+          set -ex
+          git clone "https://github.com/${SGDK_REPO}.git" SGDK
+          ( cd SGDK && git checkout "${{ inputs.sgdk_ref }}" )
+
+      - name: Generate docs (sgdkx recipe)
+        shell: bash
+        run: |
+          set -ex
+          CFG="SGDK/doc/doxyconfig"
+          if [ ! -f "$CFG" ]; then echo "no $CFG — skipping docs"; exit 0; fi
+          TMP="SGDK/doc/temp_doxyconfig"
+          cp "$CFG" "$TMP"
+          # original OUTPUT_DIRECTORY is absolute (/tmp/doxygen); rewrite to ./SGDK/doc
+          sed -i -E 's|^OUTPUT_DIRECTORY[[:space:]]*=.*$|OUTPUT_DIRECTORY = ./SGDK/doc|' "$TMP"
+          # run from the parent of SGDK so INPUT = ./SGDK/... resolves (CWD = workspace root)
+          doxygen "$TMP"
+          rm -f "$TMP"
+          test -f SGDK/doc/html/index.html
+
+      - name: Package docs
+        id: pkg
+        shell: bash
+        run: |
+          set -ex
+          if [ ! -d SGDK/doc/html ]; then echo "no docs generated — nothing to publish"; exit 0; fi
+          ASSET="sgdk-docs-${{ inputs.release_tag }}.tar.gz"
+          tar czf "$ASSET" -C SGDK/doc html
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          ls -lh "$ASSET"
+
+      - name: Upload build artifact
+        if: steps.pkg.outputs.asset != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: sgdk-docs
+          path: ${{ steps.pkg.outputs.asset }}
+
+      - name: Publish to release
+        if: steps.pkg.outputs.asset != ''
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.release_tag }}
