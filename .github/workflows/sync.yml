@@ -1,0 +1,73 @@
+name: sync
+
+# Pre-build coverage: every SGDK tag >= v2.00 + the latest master commit.
+# Discovers which refs lack a release here and builds the missing ones by calling
+# build.yml (workflow_call). Any other commit is built on-demand via build.yml's
+# workflow_dispatch.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'   # weekly, Monday 06:00 UTC
+
+permissions:
+  contents: write
+
+env:
+  SGDK_REPO: "Stephane-D/SGDK"
+
+jobs:
+  discover:
+    name: discover refs to build
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - name: Plan missing refs
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -ex
+          # SGDK tags >= v2.00 (v2.x, v3.x, ...); excludes v1.x and old unprefixed tags
+          tags=$(gh api --paginate "repos/${SGDK_REPO}/tags" --jq '.[].name' | grep -E '^v[2-9][0-9]*\.' || true)
+          # latest master commit
+          master_sha=$(gh api "repos/${SGDK_REPO}/commits/master" --jq '.sha')
+          master_short=${master_sha:0:8}
+          # releases that already exist in THIS repo
+          existing=$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 1000 --json tagName --jq '.[].tagName' || true)
+
+          items=()
+          for t in $tags; do
+            if ! grep -qxF "$t" <<<"$existing"; then
+              items+=("{\"ref\":\"$t\",\"tag\":\"$t\"}")
+            fi
+          done
+          # master -> rolling per-commit release tag; skip if this commit already built
+          mtag="master-${master_short}"
+          if ! grep -qxF "$mtag" <<<"$existing"; then
+            items+=("{\"ref\":\"${master_sha}\",\"tag\":\"${mtag}\"}")
+          fi
+
+          if [ "${#items[@]}" -eq 0 ]; then
+            matrix='[]'
+          else
+            matrix="[$(printf '%s\n' "${items[@]}" | paste -sd, -)]"
+          fi
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "planned build set: $matrix"
+
+  build:
+    name: build ${{ matrix.tag }}
+    needs: discover
+    if: needs.discover.outputs.matrix != '[]'
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        include: ${{ fromJson(needs.discover.outputs.matrix) }}
+    uses: ./.github/workflows/build.yml
+    with:
+      sgdk_ref: ${{ matrix.ref }}
+      release_tag: ${{ matrix.tag }}
