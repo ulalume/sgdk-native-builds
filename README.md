@@ -1,4 +1,4 @@
-# sgdk-builds
+# sgdk-native-builds
 
 Self-contained **native SGDK distributions** per platform (linux x86_64 / arm64,
 macOS arm64 / x86_64), built against the prebuilt gcc 13 toolchain. Each bundle
