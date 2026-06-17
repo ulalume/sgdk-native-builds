@@ -30,8 +30,9 @@ jobs:
         shell: bash
         run: |
           set -ex
-          # SGDK tags >= v2.00 (v2.x, v3.x, ...); excludes v1.x and old unprefixed tags
-          tags=$(gh api --paginate "repos/${SGDK_REPO}/tags" --jq '.[].name' | grep -E '^v[2-9][0-9]*\.' || true)
+          # SGDK tags from v1.70 (first with common.mk) upward: v1.70/1.80/1.90 + v2.x+.
+          # Excludes v1.65 and older (different build structure / pre-common.mk).
+          tags=$(gh api --paginate "repos/${SGDK_REPO}/tags" --jq '.[].name' | grep -E '^v(1\.[789]0|[2-9][0-9]*\.[0-9])' || true)
           # latest master commit
           master_sha=$(gh api "repos/${SGDK_REPO}/commits/master" --jq '.sha')
           master_short=${master_sha:0:8}
