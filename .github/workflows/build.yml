@@ -83,17 +83,22 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-x86_64, runner: ubuntu-latest,    os: linux }
-          - { name: linux-arm64,  runner: ubuntu-24.04-arm, os: linux }
-          - { name: macos-arm64,  runner: macos-14,         os: macos }
-          - { name: macos-x86_64, runner: macos-15-intel,   os: macos }
+          - { name: linux-x86_64,   runner: ubuntu-latest,    os: linux }
+          - { name: linux-arm64,    runner: ubuntu-24.04-arm, os: linux }
+          - { name: macos-arm64,    runner: macos-14,         os: macos }
+          - { name: macos-x86_64,   runner: macos-15-intel,   os: macos }
+          - { name: windows-x86_64, runner: ubuntu-latest,    os: windows-cross }   # self-contained bundle, cross-built on ubuntu via mingw
 
     steps:
       - name: Install host build deps
         shell: bash
         run: |
           set -ex
-          if [ "${{ matrix.os }}" = linux ]; then
+          if [ "${{ matrix.os }}" = windows-cross ]; then
+            sudo apt-get update
+            sudo apt-get install -y build-essential make unzip \
+              gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
+          elif [ "${{ matrix.os }}" = linux ]; then
             sudo apt-get update
             sudo apt-get install -y build-essential make
           else
@@ -101,6 +106,7 @@ jobs:
           fi
 
       - name: Fetch prebuilt gcc toolchain + mac68k
+        if: ${{ matrix.os != 'windows-cross' }}
         shell: bash
         run: |
           set -ex
@@ -123,6 +129,7 @@ jobs:
           git rev-parse HEAD
 
       - name: Build native SGDK tools (sjasm / xgmtool / bintos / convsym) + mac68k
+        if: ${{ matrix.os != 'windows-cross' }}
         shell: bash
         run: |
           set -ex
@@ -149,6 +156,7 @@ jobs:
           chmod +x "$GDK/bin/mac68k"
 
       - name: Build libmd.a (release + debug)
+        if: ${{ matrix.os != 'windows-cross' }}
         shell: bash
         run: |
           set -ex
@@ -166,6 +174,7 @@ jobs:
           ls -l lib/
 
       - name: Package self-contained SGDK
+        if: ${{ matrix.os != 'windows-cross' }}
         id: pkg
         shell: bash
         run: |
@@ -179,16 +188,156 @@ jobs:
           echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
           ls -lh "$ASSET"
 
+      # --- Windows self-contained bundle (cross-built on ubuntu via mingw) ---
+      # Mirrors what upstream SGDK ships: a $(GDK) tree whose bin/ has the m68k toolchain
+      # (bare names), the MSYS shell utils (kept from upstream), the native tools as .exe,
+      # mac68k.exe, the jars, + lib/{libgcc,libmd,libmd_debug}.a. We never run gcc.exe here:
+      # native tools are mingw-cross-compiled, and libmd.a (target object code) is built with
+      # the *Linux* m68k toolchain. KEEP .exe/.dll (unlike the Unix package step).
+      - name: Build + package Windows bundle (cross)
+        if: ${{ matrix.os == 'windows-cross' }}
+        id: pkgwin
+        shell: bash
+        run: |
+          set -ex
+          ROOT="$PWD"
+          GDK="$ROOT/SGDK"
+          JOBS="$(nproc)"
+          CCW=x86_64-w64-mingw32-gcc
+          CXXW=x86_64-w64-mingw32-g++
+          STRIPW=x86_64-w64-mingw32-strip
+          STATIC="-static -static-libgcc -static-libstdc++"
+
+          # --- W2: fetch Windows toolchain (for the bundle) + Linux toolchain (to build libmd) + maccer ---
+          curl -fSL -o win-tc.tar.gz \
+            "https://github.com/${TOOLCHAIN_REPO}/releases/download/${TOOLCHAIN_TAG}/m68k-elf-toolchain-gcc${GCC_VERSION}-windows-x86_64.tar.gz"
+          mkdir -p win-tc && tar xf win-tc.tar.gz -C win-tc          # -> win-tc/m68k-elf-toolchain/{bin,lib}
+          curl -fSL -o lx-tc.tar.gz \
+            "https://github.com/${TOOLCHAIN_REPO}/releases/download/${TOOLCHAIN_TAG}/m68k-elf-toolchain-gcc${GCC_VERSION}-linux-x86_64.tar.gz"
+          mkdir -p lx-tc && tar xf lx-tc.tar.gz -C lx-tc            # -> lx-tc/m68k-elf-toolchain/{bin,lib}
+          curl -fSL -o maccer.zip \
+            "https://github.com/${MACCER_REPO}/releases/download/${MACCER_TAG}/mac68k-windows-x86_64.zip"
+          unzip -o maccer.zip                                       # -> mac68k-windows-x86_64/mac68k.exe
+          WIN_TC="$ROOT/win-tc/m68k-elf-toolchain"
+          LX_TC="$ROOT/lx-tc/m68k-elf-toolchain"
+
+          # --- W4: cross-build native tools to .exe (mingw) ---
+          git clone https://github.com/Konamiman/Sjasm "$ROOT/Sjasm"
+          ( cd "$ROOT/Sjasm" && git checkout "${SJASM_VERSION}" )
+          # sjasm Makefile hard-codes g++/strip in the link recipe + gates .exe on `uname|grep MINGW`,
+          # neither of which works cross on Linux -> compile/link explicitly.
+          ( cd "$ROOT/Sjasm/Sjasm"
+            $CXXW -Wall -O2 -DMINGW -c *.cpp
+            $CXXW $STATIC -o sjasm.exe *.o
+            $STRIPW sjasm.exe
+            cp sjasm.exe "$GDK/bin/sjasm.exe" )
+          ( cd "$GDK/tools/xgmtool" && $CCW src/*.c -Wall -O2 $STATIC -lm -o xgmtool.exe && $STRIPW xgmtool.exe && cp xgmtool.exe "$GDK/bin/" )
+          ( cd "$GDK/tools/bintos"  && $CCW src/bintos.c -Wall -O2 $STATIC -o bintos.exe && $STRIPW bintos.exe && cp bintos.exe "$GDK/bin/" )
+          ( cd "$GDK/tools/convsym"
+            make CXX="$CXXW" LDFLAGS="-s $STATIC" -j"$JOBS"
+            if [ -f build/convsym.exe ]; then cp build/convsym.exe "$GDK/bin/convsym.exe"; else cp build/convsym "$GDK/bin/convsym.exe"; fi )
+          cp "$ROOT/mac68k-windows-x86_64/mac68k.exe" "$GDK/bin/mac68k.exe"
+
+          # --- W5: replace m68k toolchain in SGDK/bin with ours; KEEP MSYS layer; purge old-gcc cruft ---
+          for f in gcc.exe cpp.exe cc1.exe lto1.exe lto-wrapper.exe \
+                   as.exe ld.exe ar.exe nm.exe objcopy.exe objdump.exe ranlib.exe strip.exe \
+                   liblto_plugin.dll; do
+            [ -f "$WIN_TC/bin/$f" ] && cp "$WIN_TC/bin/$f" "$GDK/bin/$f"
+          done
+          cp "$WIN_TC"/bin/*.dll "$GDK/bin/" 2>/dev/null || true    # our mingw runtime DLLs (match our gcc ABI)
+          mkdir -p "$GDK/lib"
+          cp "$WIN_TC/lib/libgcc.a" "$GDK/lib/libgcc.a"
+          # purge upstream's bundled-gcc remnants (older Windows bundles ship gcc 6.3.0): -B$(BIN)
+          # ignores them at runtime but they bloat/confuse the asset.
+          rm -rf "$GDK/bin/lib/gcc" "$GDK/bin/libexec" 2>/dev/null || true
+          find "$GDK/bin" -maxdepth 1 -name 'm68k-elf-*.exe' -delete 2>/dev/null || true
+          # KEPT verbatim from upstream: sh.exe/rm.exe/cp.exe/mkdir.exe/make.exe + msys-*.dll + *.jar
+
+          # --- bundle any mingw runtime DLL the .exe files actually import (transitive closure) ---
+          locate_dll() {
+            local p; p="$($CCW -print-file-name="$1" 2>/dev/null)"
+            if [ -f "$p" ]; then echo "$p"; return 0; fi
+            find /usr/lib/gcc/x86_64-w64-mingw32 /usr/x86_64-w64-mingw32 2>/dev/null -name "$1" | head -1
+          }
+          changed=1
+          while [ "$changed" = 1 ]; do
+            changed=0
+            for f in "$GDK/bin/"*.exe "$GDK/bin/"*.dll; do
+              [ -f "$f" ] || continue
+              for d in $(x86_64-w64-mingw32-objdump -p "$f" 2>/dev/null | awk '/DLL Name:/{print $3}'); do
+                case "$d" in
+                  libgcc_s_*.dll|libstdc++-*.dll|libwinpthread-*.dll|libssp-*.dll|libgomp-*.dll|libquadmath-*.dll)
+                    if [ ! -f "$GDK/bin/$d" ]; then
+                      src="$(locate_dll "$d")"
+                      if [ -n "$src" ] && [ -f "$src" ]; then cp "$src" "$GDK/bin/$d"; changed=1; fi
+                    fi ;;
+                esac
+              done
+            done
+          done
+
+          # --- W6: build libmd.a + libmd_debug.a with the LINUX m68k toolchain (target object code) ---
+          # Build in a scratch copy populated with LINUX native tools; common.mk on this ubuntu
+          # runner takes the Unix branch (PREFIX=m68k-elf-, bare convsym/sjasm/bintos from PATH).
+          cp -a "$GDK" "$ROOT/SGDK-lib"
+          GDKL="$ROOT/SGDK-lib"
+          # rebuild sjasm natively (force-drop the mingw .o objects from the cross build first)
+          ( cd "$ROOT/Sjasm/Sjasm" && rm -f *.o sjasm sjasm.exe; make sjasm -j"$JOBS"; cp sjasm "$GDKL/bin/sjasm" )
+          ( cd "$GDKL/tools/xgmtool" && gcc src/*.c -O2 -lm -o xgmtool && cp xgmtool "$GDKL/bin/xgmtool" )
+          ( cd "$GDKL/tools/bintos"  && gcc src/bintos.c -O2 -o bintos && cp bintos "$GDKL/bin/bintos" )
+          ( cd "$GDKL/tools/convsym" && rm -rf build; make -j"$JOBS"; cp build/convsym "$GDKL/bin/convsym" )
+          export PATH="$GDKL/bin:$LX_TC/bin:$PATH"
+          ( cd "$GDKL"
+            make -f makelib.gen release
+            # wipe build artifacts between release and debug (keep bin/ tools + lib/ release lib).
+            # NOT `|| true`: a clean failure here would silently let `debug` reuse release objects,
+            # shipping a libmd_debug.a without debug flags.
+            git clean -fdx -e /bin -e /lib
+            make -f makelib.gen debug
+            ls -l lib/ )
+          cp "$GDKL/lib/libmd.a"       "$GDK/lib/libmd.a"
+          cp "$GDKL/lib/libmd_debug.a" "$GDK/lib/libmd_debug.a"
+
+          # --- W7: verify the bundle is complete, then package (KEEP .exe/.dll — they ARE the distro) ---
+          rm -rf "$GDK/.git"
+          # assert the critical pieces landed (the `[ -f ] && cp` guards above skip silently on a
+          # layout mismatch; catch a gcc-less / lib-less bundle here instead of on the user's box).
+          for need in bin/gcc.exe bin/cc1.exe bin/as.exe bin/ld.exe bin/ar.exe bin/nm.exe \
+                      bin/objcopy.exe bin/liblto_plugin.dll bin/sh.exe bin/make.exe bin/rm.exe \
+                      bin/sjasm.exe bin/convsym.exe bin/bintos.exe bin/xgmtool.exe bin/mac68k.exe \
+                      lib/libgcc.a lib/libmd.a lib/libmd_debug.a; do
+            [ -e "$GDK/$need" ] || { echo "ERROR: bundle missing $need" >&2; exit 1; }
+          done
+          # audit AND assert imported mingw runtime DLLs are bundled
+          echo "=== SGDK/bin DLL import audit ==="
+          missing=0
+          for f in "$GDK/bin/"*.exe; do
+            [ -f "$f" ] || continue
+            echo "-- $(basename "$f") --"
+            for d in $(x86_64-w64-mingw32-objdump -p "$f" 2>/dev/null | awk '/DLL Name:/{print $3}'); do
+              echo "   $d"
+              case "$d" in
+                libgcc_s_*.dll|libstdc++-*.dll|libwinpthread-*.dll|libssp-*.dll|libgomp-*.dll|libquadmath-*.dll)
+                  [ -f "$GDK/bin/$d" ] || { echo "   ERROR: $d imported by $(basename "$f") but not bundled" >&2; missing=1; } ;;
+              esac
+            done
+          done
+          [ "$missing" = 0 ] || { echo "ERROR: required mingw runtime DLL(s) missing from bundle" >&2; exit 1; }
+          ASSET="sgdk-${{ inputs.release_tag }}-windows-x86_64.tar.gz"
+          tar czf "$ASSET" -C "$ROOT" SGDK
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          ls -lh "$ASSET"
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
           name: sgdk-${{ matrix.name }}
-          path: ${{ steps.pkg.outputs.asset }}
+          path: ${{ steps.pkg.outputs.asset || steps.pkgwin.outputs.asset }}
 
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ inputs.release_tag }}" "${{ steps.pkg.outputs.asset }}" --clobber --repo "${{ github.repository }}"
+        run: gh release upload "${{ inputs.release_tag }}" "${{ steps.pkg.outputs.asset || steps.pkgwin.outputs.asset }}" --clobber --repo "${{ github.repository }}"
 
   # Docs are platform-independent: generate ONCE and ship as a separate asset
   # (sgdkx downloads it instead of running doxygen locally). Recipe mirrors sgdkx's
