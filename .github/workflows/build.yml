@@ -29,6 +29,7 @@ permissions:
   contents: write
 
 env:
+  DEBIAN_FRONTEND: "noninteractive"   # apt: never block on a debconf prompt (mingw threading default)
   GCC_VERSION: "13.2.0"
   TOOLCHAIN_REPO: "ulalume/m68k-toolchain-builds"
   TOOLCHAIN_TAG: "gcc13.2.0-1"        # m68k-toolchain-builds release providing the gcc 13 toolchain
