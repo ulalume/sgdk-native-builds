@@ -1,9 +1,10 @@
 name: sync
 
-# Pre-build coverage: every SGDK tag >= v2.00 + the latest master commit.
-# Discovers which refs lack a release here and builds the missing ones by calling
-# build.yml (workflow_call). Any other commit is built on-demand via build.yml's
-# workflow_dispatch.
+# Pre-build coverage: every SGDK tag >= v1.70 (first with common.mk) + the latest master
+# commit, AND any EXISTING release that is missing a platform asset (so releases cut before
+# a platform existed — e.g. windows — get backfilled). Builds the gaps by calling build.yml
+# (workflow_call); build.yml's --clobber upload fills in only the missing platforms. Any other
+# commit is built on-demand via build.yml's workflow_dispatch.
 
 on:
   workflow_dispatch:
@@ -30,26 +31,39 @@ jobs:
         shell: bash
         run: |
           set -ex
+
           # SGDK tags from v1.70 (first with common.mk) upward: v1.70/1.80/1.90 + v2.x+.
           # Excludes v1.65 and older (different build structure / pre-common.mk).
           tags=$(gh api --paginate "repos/${SGDK_REPO}/tags" --jq '.[].name' | grep -E '^v(1\.[789]0|[2-9][0-9]*\.[0-9])' || true)
-          # latest master commit
+          # latest master commit -> rolling per-commit release tag
           master_sha=$(gh api "repos/${SGDK_REPO}/commits/master" --jq '.sha')
-          master_short=${master_sha:0:8}
+          master_tag="master-${master_sha:0:8}"
+
           # releases that already exist in THIS repo
           existing=$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 1000 --json tagName --jq '.[].tagName' || true)
+          # EXISTING releases missing >=1 platform bundle (sgdk-<tag>-<platform>.tar.gz) — one API
+          # call; jq flags any release whose assets don't cover all 5 platforms (backfill targets).
+          incomplete=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '
+            .[] | .tag_name as $t | (.assets | map(.name)) as $have
+            | if (["linux-x86_64","linux-arm64","macos-arm64","macos-x86_64","windows-x86_64"]
+                  | all(. as $p | $have | index("sgdk-\($t)-\($p).tar.gz")))
+              then empty else $t end' || true)
+
+          # Candidates = upstream tags + latest master + every existing release (dedup, drop blanks).
+          # Quoted vars keep each tag on its own line regardless of IFS.
+          candidates=$(printf '%s\n' "$tags" "$master_tag" "$existing" | sort -u | grep -v '^$' || true)
 
           items=()
-          for t in $tags; do
-            if ! grep -qxF "$t" <<<"$existing"; then
-              items+=("{\"ref\":\"$t\",\"tag\":\"$t\"}")
+          while IFS= read -r tag; do
+            [ -z "$tag" ] && continue
+            # ref to build: master-<sha> -> <sha> ; version tag -> itself
+            case "$tag" in master-*) ref="${tag#master-}" ;; *) ref="$tag" ;; esac
+            # build if NOT yet released, OR released-but-incomplete; skip released-and-complete
+            if grep -qxF "$tag" <<<"$existing"; then
+              grep -qxF "$tag" <<<"$incomplete" || continue
             fi
-          done
-          # master -> rolling per-commit release tag; skip if this commit already built
-          mtag="master-${master_short}"
-          if ! grep -qxF "$mtag" <<<"$existing"; then
-            items+=("{\"ref\":\"${master_sha}\",\"tag\":\"${mtag}\"}")
-          fi
+            items+=("{\"ref\":\"$ref\",\"tag\":\"$tag\"}")
+          done <<<"$candidates"
 
           if [ "${#items[@]}" -eq 0 ]; then
             matrix='[]'
