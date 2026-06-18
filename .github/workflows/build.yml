@@ -146,11 +146,12 @@ jobs:
           make sjasm -j"$JOBS"
           cp sjasm "$GDK/bin/sjasm"
 
-          # xgmtool / bintos (host C)
-          cd "$GDK/tools/xgmtool" && gcc src/*.c -Wall -O2 -lm -o xgmtool && cp xgmtool "$GDK/bin/"
-          cd "$GDK/tools/bintos"  && gcc src/bintos.c -Wall -O2 -o bintos && cp bintos "$GDK/bin/"
-          # convsym (its own Makefile)
-          cd "$GDK/tools/convsym" && make -j"$JOBS" && cp build/convsym "$GDK/bin/"
+          # native tools — build each only if its source exists in this SGDK version
+          # (convsym was added in v2.10; xgmtool/bintos go further back). Skipping a missing one
+          # is correct: that version's makefile doesn't use it.
+          if [ -d "$GDK/tools/xgmtool" ]; then ( cd "$GDK/tools/xgmtool" && gcc src/*.c -Wall -O2 -lm -o xgmtool && cp xgmtool "$GDK/bin/" ); fi
+          if [ -d "$GDK/tools/bintos" ];  then ( cd "$GDK/tools/bintos"  && gcc src/bintos.c -Wall -O2 -o bintos && cp bintos "$GDK/bin/" ); fi
+          if [ -d "$GDK/tools/convsym" ]; then ( cd "$GDK/tools/convsym" && make -j"$JOBS" && cp build/convsym "$GDK/bin/" ); fi
 
           # mac68k (prebuilt, for .asm projects)
           cp "$ROOT/mac68k-${{ matrix.name }}/mac68k" "$GDK/bin/mac68k"
@@ -232,11 +233,14 @@ jobs:
             $CXXW $STATIC -o sjasm.exe *.o
             $STRIPW sjasm.exe
             cp sjasm.exe "$GDK/bin/sjasm.exe" )
-          ( cd "$GDK/tools/xgmtool" && $CCW src/*.c -Wall -O2 $STATIC -lm -o xgmtool.exe && $STRIPW xgmtool.exe && cp xgmtool.exe "$GDK/bin/" )
-          ( cd "$GDK/tools/bintos"  && $CCW src/bintos.c -Wall -O2 $STATIC -o bintos.exe && $STRIPW bintos.exe && cp bintos.exe "$GDK/bin/" )
-          ( cd "$GDK/tools/convsym"
-            make CXX="$CXXW" LDFLAGS="-s $STATIC" -j"$JOBS"
-            if [ -f build/convsym.exe ]; then cp build/convsym.exe "$GDK/bin/convsym.exe"; else cp build/convsym "$GDK/bin/convsym.exe"; fi )
+          # native tools — only those present in this SGDK version (convsym arrived in v2.10)
+          if [ -d "$GDK/tools/xgmtool" ]; then ( cd "$GDK/tools/xgmtool" && $CCW src/*.c -Wall -O2 $STATIC -lm -o xgmtool.exe && $STRIPW xgmtool.exe && cp xgmtool.exe "$GDK/bin/" ); fi
+          if [ -d "$GDK/tools/bintos" ];  then ( cd "$GDK/tools/bintos"  && $CCW src/bintos.c -Wall -O2 $STATIC -o bintos.exe && $STRIPW bintos.exe && cp bintos.exe "$GDK/bin/" ); fi
+          if [ -d "$GDK/tools/convsym" ]; then
+            ( cd "$GDK/tools/convsym"
+              make CXX="$CXXW" LDFLAGS="-s $STATIC" -j"$JOBS"
+              if [ -f build/convsym.exe ]; then cp build/convsym.exe "$GDK/bin/convsym.exe"; else cp build/convsym "$GDK/bin/convsym.exe"; fi )
+          fi
           cp "$ROOT/mac68k-windows-x86_64/mac68k.exe" "$GDK/bin/mac68k.exe"
 
           # --- W5: replace m68k toolchain in SGDK/bin with ours; KEEP MSYS layer; purge old-gcc cruft ---
@@ -284,9 +288,9 @@ jobs:
           GDKL="$ROOT/SGDK-lib"
           # rebuild sjasm natively (force-drop the mingw .o objects from the cross build first)
           ( cd "$ROOT/Sjasm/Sjasm" && rm -f *.o sjasm sjasm.exe; make sjasm -j"$JOBS"; cp sjasm "$GDKL/bin/sjasm" )
-          ( cd "$GDKL/tools/xgmtool" && gcc src/*.c -O2 -lm -o xgmtool && cp xgmtool "$GDKL/bin/xgmtool" )
-          ( cd "$GDKL/tools/bintos"  && gcc src/bintos.c -O2 -o bintos && cp bintos "$GDKL/bin/bintos" )
-          ( cd "$GDKL/tools/convsym" && rm -rf build; make -j"$JOBS"; cp build/convsym "$GDKL/bin/convsym" )
+          if [ -d "$GDKL/tools/xgmtool" ]; then ( cd "$GDKL/tools/xgmtool" && gcc src/*.c -O2 -lm -o xgmtool && cp xgmtool "$GDKL/bin/xgmtool" ); fi
+          if [ -d "$GDKL/tools/bintos" ];  then ( cd "$GDKL/tools/bintos"  && gcc src/bintos.c -O2 -o bintos && cp bintos "$GDKL/bin/bintos" ); fi
+          if [ -d "$GDKL/tools/convsym" ]; then ( cd "$GDKL/tools/convsym" && rm -rf build; make -j"$JOBS"; cp build/convsym "$GDKL/bin/convsym" ); fi
           export PATH="$GDKL/bin:$LX_TC/bin:$PATH"
           ( cd "$GDKL"
             make -f makelib.gen release
@@ -303,11 +307,19 @@ jobs:
           rm -rf "$GDK/.git"
           # assert the critical pieces landed (the `[ -f ] && cp` guards above skip silently on a
           # layout mismatch; catch a gcc-less / lib-less bundle here instead of on the user's box).
+          # Always-required (every SGDK >= v1.70):
           for need in bin/gcc.exe bin/cc1.exe bin/as.exe bin/ld.exe bin/ar.exe bin/nm.exe \
                       bin/objcopy.exe bin/liblto_plugin.dll bin/sh.exe bin/make.exe bin/rm.exe \
-                      bin/sjasm.exe bin/convsym.exe bin/bintos.exe bin/xgmtool.exe bin/mac68k.exe \
+                      bin/sjasm.exe bin/mac68k.exe \
                       lib/libgcc.a lib/libmd.a lib/libmd_debug.a; do
             [ -e "$GDK/$need" ] || { echo "ERROR: bundle missing $need" >&2; exit 1; }
+          done
+          # version-variable native tools: assert only when this SGDK version ships the source
+          # (convsym arrived in v2.10; xgmtool/bintos go back further).
+          for t in xgmtool bintos convsym; do
+            if [ -d "$GDK/tools/$t" ]; then
+              [ -e "$GDK/bin/$t.exe" ] || { echo "ERROR: bundle missing bin/$t.exe (tools/$t present)" >&2; exit 1; }
+            fi
           done
           # audit AND assert imported mingw runtime DLLs are bundled
           echo "=== SGDK/bin DLL import audit ==="
