@@ -188,7 +188,9 @@ jobs:
               if [ -d "$GDK/tools/xgmtool" ]; then ( cd "$GDK/tools/xgmtool" && gcc -include stdint.h src/*.c -Wall -O2 -lm -o xgmtool && cp xgmtool "$GDK/bin/" ); fi
               if [ -d "$GDK/tools/bintos" ];  then ( cd "$GDK/tools/bintos"  && gcc -include stdint.h src/bintos.c -Wall -O2 -o bintos && cp bintos "$GDK/bin/" ); fi
               if [ -d "$GDK/tools/convsym" ]; then ( cd "$GDK/tools/convsym" && make -j"$JOBS" && cp build/convsym "$GDK/bin/" ); fi
-              chown -R "$(stat -c "%u:%g" "$ROOT")" "$GDK/bin"
+              # hand the WHOLE SGDK tree back to the runner: the container (root) also wrote build
+              # artifacts under tools/*/ , and the host libmd step `git clean`s them -> must be runner-owned.
+              chown -R "$(stat -c "%u:%g" "$ROOT")" "$GDK"
             '
           # mac68k (prebuilt from maccer) — copied on the host
           cp "$PWD/mac68k-${{ matrix.name }}/mac68k" "$PWD/SGDK/bin/mac68k"
