@@ -50,26 +50,37 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # date of the SGDK commit this ref points to (ISO 8601, git-acceptable)
-          SGDK_DATE="$(gh api "repos/${SGDK_REPO}/commits/${{ inputs.sgdk_ref }}" --jq '.commit.committer.date')"
+          REF="${{ inputs.sgdk_ref }}"
+          TAG="${{ inputs.release_tag }}"
+          # resolve the upstream commit this ref points to: its full sha + date + a link
+          SGDK_SHA="$(gh api "repos/${SGDK_REPO}/commits/${REF}" --jq '.sha')"
+          SGDK_DATE="$(gh api "repos/${SGDK_REPO}/commits/${REF}" --jq '.commit.committer.date')"
+          SRC_URL="https://github.com/${SGDK_REPO}/commit/${SGDK_SHA}"
+
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           empty="$(git hash-object -t tree /dev/null)"
           # empty commit dated at the upstream commit time -> Releases page sorts chronologically
-          c="$(GIT_AUTHOR_DATE="$SGDK_DATE" GIT_COMMITTER_DATE="$SGDK_DATE" git commit-tree "$empty" -m "${{ inputs.release_tag }}")"
-          TAG="${{ inputs.release_tag }}"
+          c="$(GIT_AUTHOR_DATE="$SGDK_DATE" GIT_COMMITTER_DATE="$SGDK_DATE" git commit-tree "$empty" -m "$TAG")"
           git tag -f "$TAG" "$c"
           git push -f origin "refs/tags/$TAG"
-          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
-              --title "SGDK $TAG" \
-              --notes "Native SGDK build — upstream ref \`${{ inputs.sgdk_ref }}\` ($SGDK_DATE)." \
-              --latest=false
+
+          # Title + notes are ALWAYS (re)set so every build/backfill normalizes older releases that
+          # were created with a different format. Notes link the exact upstream SGDK commit.
+          TITLE="SGDK $TAG"
+          NOTES="Native SGDK build — upstream ref \`${REF}\` (${SGDK_DATE}).
+
+          SGDK source commit: ${SRC_URL}"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TITLE" --notes "$NOTES"
+          else
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TITLE" --notes "$NOTES" --latest=false
           fi
-          # "Latest" badge policy: only the master build is Latest (newest SGDK). Version
-          # tags never grab it, so an old tag (e.g. v1.70) can't become Latest regardless
-          # of build order. gh defaults make_latest=true on create, hence the explicit set.
-          if [ "${TAG#master-}" != "$TAG" ]; then
+
+          # "Latest" badge: only the master build whose commit IS the current SGDK master HEAD.
+          # Version tags and OLD-master backfills (built later by wall-clock) must never grab it.
+          master_head="$(gh api "repos/${SGDK_REPO}/commits/master" --jq '.sha')"
+          if [ "${TAG#master-}" != "$TAG" ] && [ "$SGDK_SHA" = "$master_head" ]; then
             gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --latest
           else
             gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --latest=false
