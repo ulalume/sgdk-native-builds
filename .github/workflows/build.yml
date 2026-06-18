@@ -149,8 +149,10 @@ jobs:
           # native tools — build each only if its source exists in this SGDK version
           # (convsym was added in v2.10; xgmtool/bintos go further back). Skipping a missing one
           # is correct: that version's makefile doesn't use it.
-          if [ -d "$GDK/tools/xgmtool" ]; then ( cd "$GDK/tools/xgmtool" && gcc src/*.c -Wall -O2 -lm -o xgmtool && cp xgmtool "$GDK/bin/" ); fi
-          if [ -d "$GDK/tools/bintos" ];  then ( cd "$GDK/tools/bintos"  && gcc src/bintos.c -Wall -O2 -o bintos && cp bintos "$GDK/bin/" ); fi
+          # -include stdint.h: some older versions (e.g. v1.80) use uint8_t in headers without
+          # including stdint.h; glibc/gcc errors where macOS headers pull it in transitively.
+          if [ -d "$GDK/tools/xgmtool" ]; then ( cd "$GDK/tools/xgmtool" && gcc -include stdint.h src/*.c -Wall -O2 -lm -o xgmtool && cp xgmtool "$GDK/bin/" ); fi
+          if [ -d "$GDK/tools/bintos" ];  then ( cd "$GDK/tools/bintos"  && gcc -include stdint.h src/bintos.c -Wall -O2 -o bintos && cp bintos "$GDK/bin/" ); fi
           if [ -d "$GDK/tools/convsym" ]; then ( cd "$GDK/tools/convsym" && make -j"$JOBS" && cp build/convsym "$GDK/bin/" ); fi
 
           # mac68k (prebuilt, for .asm projects)
@@ -234,8 +236,8 @@ jobs:
             $STRIPW sjasm.exe
             cp sjasm.exe "$GDK/bin/sjasm.exe" )
           # native tools — only those present in this SGDK version (convsym arrived in v2.10)
-          if [ -d "$GDK/tools/xgmtool" ]; then ( cd "$GDK/tools/xgmtool" && $CCW src/*.c -Wall -O2 $STATIC -lm -o xgmtool.exe && $STRIPW xgmtool.exe && cp xgmtool.exe "$GDK/bin/" ); fi
-          if [ -d "$GDK/tools/bintos" ];  then ( cd "$GDK/tools/bintos"  && $CCW src/bintos.c -Wall -O2 $STATIC -o bintos.exe && $STRIPW bintos.exe && cp bintos.exe "$GDK/bin/" ); fi
+          if [ -d "$GDK/tools/xgmtool" ]; then ( cd "$GDK/tools/xgmtool" && $CCW -include stdint.h src/*.c -Wall -O2 $STATIC -lm -o xgmtool.exe && $STRIPW xgmtool.exe && cp xgmtool.exe "$GDK/bin/" ); fi
+          if [ -d "$GDK/tools/bintos" ];  then ( cd "$GDK/tools/bintos"  && $CCW -include stdint.h src/bintos.c -Wall -O2 $STATIC -o bintos.exe && $STRIPW bintos.exe && cp bintos.exe "$GDK/bin/" ); fi
           if [ -d "$GDK/tools/convsym" ]; then
             ( cd "$GDK/tools/convsym"
               make CXX="$CXXW" LDFLAGS="-s $STATIC" -j"$JOBS"
@@ -288,8 +290,8 @@ jobs:
           GDKL="$ROOT/SGDK-lib"
           # rebuild sjasm natively (force-drop the mingw .o objects from the cross build first)
           ( cd "$ROOT/Sjasm/Sjasm" && rm -f *.o sjasm sjasm.exe; make sjasm -j"$JOBS"; cp sjasm "$GDKL/bin/sjasm" )
-          if [ -d "$GDKL/tools/xgmtool" ]; then ( cd "$GDKL/tools/xgmtool" && gcc src/*.c -O2 -lm -o xgmtool && cp xgmtool "$GDKL/bin/xgmtool" ); fi
-          if [ -d "$GDKL/tools/bintos" ];  then ( cd "$GDKL/tools/bintos"  && gcc src/bintos.c -O2 -o bintos && cp bintos "$GDKL/bin/bintos" ); fi
+          if [ -d "$GDKL/tools/xgmtool" ]; then ( cd "$GDKL/tools/xgmtool" && gcc -include stdint.h src/*.c -O2 -lm -o xgmtool && cp xgmtool "$GDKL/bin/xgmtool" ); fi
+          if [ -d "$GDKL/tools/bintos" ];  then ( cd "$GDKL/tools/bintos"  && gcc -include stdint.h src/bintos.c -O2 -o bintos && cp bintos "$GDKL/bin/bintos" ); fi
           if [ -d "$GDKL/tools/convsym" ]; then ( cd "$GDKL/tools/convsym" && rm -rf build; make -j"$JOBS"; cp build/convsym "$GDKL/bin/convsym" ); fi
           export PATH="$GDKL/bin:$LX_TC/bin:$PATH"
           ( cd "$GDKL"
