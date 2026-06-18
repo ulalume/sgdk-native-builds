@@ -95,8 +95,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { name: linux-x86_64,   runner: ubuntu-latest,    os: linux }
-          - { name: linux-arm64,    runner: ubuntu-24.04-arm, os: linux }
+          # Linux native tools built INSIDE manylinux2014 (glibc 2.17) so they run on old distros.
+          # (libmd.a is m68k target code -> built on the host; only the glibc-linked native tools
+          # need the old container.)
+          - { name: linux-x86_64,   runner: ubuntu-latest,    os: linux, container: "quay.io/pypa/manylinux2014_x86_64" }
+          - { name: linux-arm64,    runner: ubuntu-24.04-arm, os: linux, container: "quay.io/pypa/manylinux2014_aarch64" }
           - { name: macos-arm64,    runner: macos-14,         os: macos }
           - { name: macos-x86_64,   runner: macos-15-intel,   os: macos }
           - { name: windows-x86_64, runner: ubuntu-latest,    os: windows-cross }   # self-contained bundle, cross-built on ubuntu via mingw
@@ -110,12 +113,11 @@ jobs:
             sudo apt-get update
             sudo apt-get install -y build-essential make unzip \
               gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64
-          elif [ "${{ matrix.os }}" = linux ]; then
-            sudo apt-get update
-            sudo apt-get install -y build-essential make
-          else
+          elif [ "${{ matrix.os }}" = macos ]; then
             brew install make || true
           fi
+          # linux: native tools build inside the manylinux2014 container; libmd builds on the host
+          # with the downloaded m68k toolchain (make/curl/tar are preinstalled on the runner).
 
       - name: Fetch prebuilt gcc toolchain + mac68k
         if: ${{ matrix.os != 'windows-cross' }}
@@ -140,28 +142,27 @@ jobs:
           git checkout "${{ inputs.sgdk_ref }}"
           git rev-parse HEAD
 
-      - name: Build native SGDK tools (sjasm / xgmtool / bintos / convsym) + mac68k
-        if: ${{ matrix.os != 'windows-cross' }}
+      - name: Build native SGDK tools (macOS native) + mac68k
+        if: ${{ matrix.os == 'macos' }}
         shell: bash
         run: |
           set -ex
           ROOT="$PWD"
           GDK="$ROOT/SGDK"
-          if [ "${{ matrix.os }}" = macos ]; then JOBS="$(sysctl -n hw.ncpu)"; else JOBS="$(nproc)"; fi
+          JOBS="$(sysctl -n hw.ncpu)"
+          export CC=/usr/bin/gcc CXX=/usr/bin/g++
 
           # sjasm (Konamiman) — host C++ build
           git clone https://github.com/Konamiman/Sjasm "$ROOT/Sjasm"
           cd "$ROOT/Sjasm" && git checkout "${SJASM_VERSION}" && cd Sjasm
           make clean || true
-          if [ "${{ matrix.os }}" = macos ]; then export CC=/usr/bin/gcc CXX=/usr/bin/g++; fi
           make sjasm -j"$JOBS"
           cp sjasm "$GDK/bin/sjasm"
 
           # native tools — build each only if its source exists in this SGDK version
           # (convsym was added in v2.10; xgmtool/bintos go further back). Skipping a missing one
           # is correct: that version's makefile doesn't use it.
-          # -include stdint.h: some older versions (e.g. v1.80) use uint8_t in headers without
-          # including stdint.h; glibc/gcc errors where macOS headers pull it in transitively.
+          # -include stdint.h: some older versions (e.g. v1.80) use uint8_t in headers without it.
           if [ -d "$GDK/tools/xgmtool" ]; then ( cd "$GDK/tools/xgmtool" && gcc -include stdint.h src/*.c -Wall -O2 -lm -o xgmtool && cp xgmtool "$GDK/bin/" ); fi
           if [ -d "$GDK/tools/bintos" ];  then ( cd "$GDK/tools/bintos"  && gcc -include stdint.h src/bintos.c -Wall -O2 -o bintos && cp bintos "$GDK/bin/" ); fi
           if [ -d "$GDK/tools/convsym" ]; then ( cd "$GDK/tools/convsym" && make -j"$JOBS" && cp build/convsym "$GDK/bin/" ); fi
@@ -169,6 +170,29 @@ jobs:
           # mac68k (prebuilt, for .asm projects)
           cp "$ROOT/mac68k-${{ matrix.name }}/mac68k" "$GDK/bin/mac68k"
           chmod +x "$GDK/bin/mac68k"
+
+      # Linux: same native tools, built INSIDE manylinux2014 (glibc 2.17). Output goes into the
+      # bind-mounted SGDK/bin; chown back to the runner so the host libmd/package steps can use it.
+      - name: Build native SGDK tools (Linux in manylinux2014) + mac68k
+        if: ${{ matrix.os == 'linux' }}
+        shell: bash
+        run: |
+          set -ex
+          docker run --rm -e SJASM_VERSION -v "$PWD:$PWD" -w "$PWD" \
+            "${{ matrix.container }}" bash -euxc '
+              ROOT="$PWD"; GDK="$ROOT/SGDK"; JOBS="$(nproc)"
+              git config --global --add safe.directory "*"
+              git clone https://github.com/Konamiman/Sjasm "$ROOT/Sjasm"
+              cd "$ROOT/Sjasm" && git checkout "${SJASM_VERSION}" && cd Sjasm
+              make clean || true; make sjasm -j"$JOBS"; cp sjasm "$GDK/bin/sjasm"
+              if [ -d "$GDK/tools/xgmtool" ]; then ( cd "$GDK/tools/xgmtool" && gcc -include stdint.h src/*.c -Wall -O2 -lm -o xgmtool && cp xgmtool "$GDK/bin/" ); fi
+              if [ -d "$GDK/tools/bintos" ];  then ( cd "$GDK/tools/bintos"  && gcc -include stdint.h src/bintos.c -Wall -O2 -o bintos && cp bintos "$GDK/bin/" ); fi
+              if [ -d "$GDK/tools/convsym" ]; then ( cd "$GDK/tools/convsym" && make -j"$JOBS" && cp build/convsym "$GDK/bin/" ); fi
+              chown -R "$(stat -c "%u:%g" "$ROOT")" "$GDK/bin"
+            '
+          # mac68k (prebuilt from maccer) — copied on the host
+          cp "$PWD/mac68k-${{ matrix.name }}/mac68k" "$PWD/SGDK/bin/mac68k"
+          chmod +x "$PWD/SGDK/bin/mac68k"
 
       - name: Build libmd.a (release + debug)
         if: ${{ matrix.os != 'windows-cross' }}
