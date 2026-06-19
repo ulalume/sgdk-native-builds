@@ -1,10 +1,20 @@
 name: sync
 
-# Pre-build coverage: every SGDK tag >= v1.70 (first with common.mk) + the latest master
-# commit, AND any EXISTING release that is missing a platform asset (so releases cut before
-# a platform existed — e.g. windows — get backfilled). Builds the gaps by calling build.yml
-# (workflow_call); build.yml's --clobber upload fills in only the missing platforms. Any other
-# commit is built on-demand via build.yml's workflow_dispatch.
+# Pre-build coverage. The discover job plans the build set from four sources:
+#   1. Every SGDK tag >= v1.70 (first with common.mk).
+#   2. The latest master commit (rolling "bleeding edge" -> master-<sha>, always kept so
+#      `setup --version master`-style use always has a build; gets the Latest badge).
+#   3. NEW build-relevant master commits since the newest master-<sha> we've already built
+#      (FORWARD-ONLY, path-filtered): any commit in <baseline>..master that touches a build
+#      input (src/inc/res/tools/common.mk/md.ld/makelib.gen/makefile.gen) becomes its own
+#      master-<sha>. This captures intermediate master states between cron runs without
+#      rebuilding commits that don't change the bundle (docs, samples, .bat, etc.). We do NOT
+#      backfill history before the baseline — only commits newer than what we've built.
+#   4. Any EXISTING release missing a platform asset (so releases cut before a platform
+#      existed — e.g. windows — get backfilled).
+# Builds the gaps by calling build.yml (workflow_call); build.yml's --clobber upload fills in
+# only the missing platforms. Any other commit is built on-demand via build.yml's
+# workflow_dispatch.
 
 on:
   workflow_dispatch:
@@ -16,6 +26,17 @@ permissions:
 
 env:
   SGDK_REPO: "Stephane-D/SGDK"
+  # SGDK paths whose changes can affect the built bundle (libmd.a / native tools / shipped
+  # makefiles). A master commit touching ANY of these is built as its own master-<sha>;
+  # commits touching only docs/samples/.bat/etc. are skipped as build-identical.
+  #   src        -> library C/asm/z80 sources (incl. src/boot)
+  #   inc res    -> library headers + resources
+  #   tools      -> native tools we compile (xgmtool/bintos/convsym)
+  #   common.mk  -> shared make rules (libmd build + shipped user build)
+  #   md.ld      -> linker script (shipped, used at user link time)
+  #   makelib.gen-> libmd.a build recipe (used directly by build.yml)
+  #   makefile.gen-> shipped user-project build recipe (drives `sgdkx make`)
+  BUILD_PATHS: "src inc res tools common.mk md.ld makelib.gen makefile.gen"
 
 jobs:
   discover:
@@ -24,7 +45,15 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
-      - name: Plan missing refs
+      # Treeless clone: commits + trees, no blobs. Enough for `git log <range> -- <paths>`
+      # (path filtering diffs trees, never reads blob contents) -> cheap and no on-demand fetch.
+      - name: Clone SGDK history (treeless) for master-range filtering
+        shell: bash
+        run: |
+          set -ex
+          git clone --filter=blob:none --no-checkout "https://github.com/${SGDK_REPO}.git" sgdk-src
+
+      - name: Plan refs to build
         id: plan
         env:
           GH_TOKEN: ${{ github.token }}
@@ -49,9 +78,29 @@ jobs:
                   | all(. as $p | $have | index("sgdk-\($t)-\($p).tar.gz")))
               then empty else $t end' || true)
 
-          # Candidates = upstream tags + latest master + every existing release (dedup, drop blanks).
-          # Quoted vars keep each tag on its own line regardless of IFS.
-          candidates=$(printf '%s\n' "$tags" "$master_tag" "$existing" | sort -u | grep -v '^$' || true)
+          # --- FORWARD-ONLY path-filtered master commit coverage ---
+          # baseline = newest master commit we've ALREADY built (walk master newest-first, first
+          # already-built commit wins). We add only build-relevant commits NEWER than it — never
+          # backfill older history. If we've built no master commit yet (or the newest built one
+          # isn't on current master, e.g. after a force-push), baseline stays empty and we add
+          # nothing extra; the master_tag item above still seeds HEAD as the next baseline.
+          built_master=$(printf '%s\n' "$existing" | sed -n 's/^master-//p' | grep -v '^$' || true)
+          baseline=""
+          if [ -n "$built_master" ]; then
+            while IFS= read -r full; do
+              if grep -qxF "${full:0:8}" <<<"$built_master"; then baseline="$full"; break; fi
+            done < <(git -C sgdk-src rev-list origin/master)
+          fi
+          newmaster_tags=""
+          if [ -n "$baseline" ]; then
+            # commits in baseline..master (baseline excluded) touching a build input -> master-<sha8>
+            newmaster_tags=$(git -C sgdk-src log --format='%H' "${baseline}..origin/master" -- $BUILD_PATHS \
+                             | grep -v '^$' | sed 's/^\(........\).*/master-\1/' || true)
+          fi
+
+          # Candidates = upstream tags + latest master + new build-relevant master commits + every
+          # existing release (dedup, drop blanks). Quoted vars keep each tag on its own line.
+          candidates=$(printf '%s\n' "$tags" "$master_tag" "$newmaster_tags" "$existing" | sort -u | grep -v '^$' || true)
 
           items=()
           while IFS= read -r tag; do
