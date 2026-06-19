@@ -295,6 +295,10 @@ jobs:
           # ignores them at runtime but they bloat/confuse the asset.
           rm -rf "$GDK/bin/lib/gcc" "$GDK/bin/libexec" 2>/dev/null || true
           find "$GDK/bin" -maxdepth 1 -name 'm68k-elf-*.exe' -delete 2>/dev/null || true
+          # gdb is NOT a build tool (the makefile never invokes it) -> not shipped in the bundle.
+          # sgdkx downloads m68k-elf-gdb per platform separately (incl. Windows). Drop upstream's
+          # gdb.exe so the bundle doesn't carry a stale, unmanaged duplicate.
+          rm -f "$GDK/bin/gdb.exe" 2>/dev/null || true
           # KEPT verbatim from upstream: sh.exe/rm.exe/cp.exe/mkdir.exe/make.exe + msys-*.dll + *.jar
 
           # --- bundle any mingw runtime DLL the .exe files actually import (transitive closure) ---
