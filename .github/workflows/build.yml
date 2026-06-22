@@ -142,6 +142,24 @@ jobs:
           git checkout "${{ inputs.sgdk_ref }}"
           git rev-parse HEAD
 
+      - name: Patch makefile.gen — keep debug-build DWARF valid
+        shell: bash
+        run: |
+          set -ex
+          # `make debug` links with -Wl,--gc-sections, which drops unused function
+          # code but leaves its DWARF at low_pc=0. Those orphaned entries overlap the
+          # user's code addresses, so gdb/cppdbg mis-resolve a PC in your code to SGDK
+          # internals (e.g. bmp.c/doBlit) and source-level debugging is unusable.
+          # Skip --gc-sections for DEBUG builds only (release still gets it, for size),
+          # via an inline make conditional so the single link rule serves both.
+          mk=SGDK/makefile.gen
+          if grep -qF 'filter debug,$(BUILD_TYPE)' "$mk"; then echo "already patched"; exit 0; fi
+          grep -qF -- '-Wl,--gc-sections' "$mk" || { echo "::error::-Wl,--gc-sections not found in $mk (upstream layout changed)"; exit 1; }
+          sed 's|-Wl,--gc-sections|$(if $(filter debug,$(BUILD_TYPE)),,-Wl,--gc-sections)|' "$mk" > "$mk.tmp"
+          mv "$mk.tmp" "$mk"
+          grep -qF 'filter debug,$(BUILD_TYPE)' "$mk" || { echo "::error::makefile.gen patch did not apply"; exit 1; }
+          grep -n 'gc-sections' "$mk"
+
       - name: Build native SGDK tools (macOS native) + mac68k
         if: ${{ matrix.os == 'macos' }}
         shell: bash
