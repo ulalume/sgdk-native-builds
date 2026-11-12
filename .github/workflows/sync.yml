@@ -11,10 +11,11 @@ name: sync
 #      rebuilding commits that don't change the bundle (docs, samples, .bat, etc.). We do NOT
 #      backfill history before the baseline — only commits newer than what we've built.
 #   4. Any EXISTING release missing a platform asset (so releases cut before a platform
-#      existed — e.g. windows — get backfilled).
-# Builds the gaps by calling build.yml (workflow_call); build.yml's --clobber upload fills in
-# only the missing platforms. Any other commit is built on-demand via build.yml's
-# workflow_dispatch.
+#      existed — e.g. windows — get backfilled; this includes drafts a failed build left behind).
+#      A draft that already has every bundle is not rebuilt: the publish-drafts job publishes it.
+# Builds the gaps by calling build.yml (workflow_call); build.yml replaces a same-named asset,
+# so a rebuild fills in only what was missing. Any other commit is built on-demand via
+# build.yml's workflow_dispatch.
 
 on:
   workflow_dispatch:
@@ -45,6 +46,12 @@ jobs:
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
     steps:
+      - name: Check out the platform list
+        uses: actions/checkout@v4
+        with:
+          path: .ci
+          sparse-checkout: .github
+
       # Treeless clone: commits + trees, no blobs. Enough for `git log <range> -- <paths>`
       # (path filtering diffs trees, never reads blob contents) -> cheap and no on-demand fetch.
       - name: Clone SGDK history (treeless) for master-range filtering
@@ -71,11 +78,13 @@ jobs:
           # releases that already exist in THIS repo
           existing=$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 1000 --json tagName --jq '.[].tagName' || true)
           # EXISTING releases missing >=1 platform bundle (sgdk-<tag>-<platform>.tar.gz) — one API
-          # call; jq flags any release whose assets don't cover all 5 platforms (backfill targets).
-          incomplete=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '
+          # call; jq flags any release, draft or published, whose assets don't cover every platform
+          # in .github/platforms.json (backfill targets). Drafts are listed because this call is
+          # authenticated; unauthenticated clients never see them.
+          platforms=$(jq -c '[.[].name]' .ci/.github/platforms.json)
+          incomplete=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" | jq -r --argjson plats "$platforms" '
             .[] | .tag_name as $t | (.assets | map(.name)) as $have
-            | if (["linux-x86_64","linux-arm64","macos-arm64","macos-x86_64","windows-x86_64"]
-                  | all(. as $p | $have | index("sgdk-\($t)-\($p).tar.gz")))
+            | if ($plats | all(. as $p | $have | index("sgdk-\($t)-\($p).tar.gz")))
               then empty else $t end' || true)
 
           # --- FORWARD-ONLY path-filtered master commit coverage ---
@@ -121,6 +130,38 @@ jobs:
           fi
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "planned build set: $matrix"
+
+  # A draft whose bundles are all attached only lacks the publish step (build.yml's finalize
+  # failed after the uploads, e.g. on a transient API error). Publish it directly instead of
+  # rebuilding every platform; discover never plans such a draft, so no build races this.
+  publish-drafts:
+    name: publish complete drafts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github
+      - name: Publish drafts whose platform bundles are all attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source .github/scripts/release-lib.sh
+          drafts="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+                      --jq '.[] | select(.draft) | "\(.tag_name)\t\(.id)"')"
+          status=0
+          # fd 3, so nothing in the loop body can consume the list from stdin
+          while IFS=$'\t' read -r -u 3 tag rid; do
+            [ -n "$tag" ] || continue
+            missing="$(missing_platforms "$tag" "$rid")" || { status=1; continue; }
+            if [ -n "$missing" ]; then
+              echo "$tag: still missing $(echo $missing) -- left for discover to rebuild"
+              continue
+            fi
+            publish_release "$tag" "$rid" || status=1
+          done 3<<<"$drafts"
+          exit "$status"
 
   build:
     name: build ${{ matrix.tag }}
