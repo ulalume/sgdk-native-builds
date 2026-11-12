@@ -42,9 +42,15 @@ jobs:
   release:
     name: create dated release
     runs-on: ubuntu-latest
+    outputs:
+      # Later jobs address the release by this numeric id instead of by tag: while it is still a
+      # draft, the by-tag REST endpoint hides it and `gh release view/upload/edit <tag>` cannot
+      # resolve it reliably.
+      release_id: ${{ steps.rel.outputs.release_id }}
     steps:
       - uses: actions/checkout@v4
       - name: Create release tagged at the SGDK commit date
+        id: rel
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -71,20 +77,27 @@ jobs:
           NOTES="Native SGDK build — upstream ref \`${REF}\` (${SGDK_DATE}).
 
           SGDK source commit: ${SRC_URL}"
-          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TITLE" --notes "$NOTES"
-          else
-            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TITLE" --notes "$NOTES" --latest=false
-          fi
+          # Find this tag's release INCLUDING drafts: /releases/tags/<tag> returns published
+          # releases only, so a draft has to be matched in the full (authenticated) listing.
+          rid="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases" \
+                   --jq '.[] | "\(.tag_name)\t\(.id)"' \
+                 | awk -F'\t' -v t="$TAG" '$1 == t { print $2; exit }')"
 
-          # "Latest" badge: only the master build whose commit IS the current SGDK master HEAD.
-          # Version tags and OLD-master backfills (built later by wall-clock) must never grab it.
-          master_head="$(gh api "repos/${SGDK_REPO}/commits/master" --jq '.sha')"
-          if [ "${TAG#master-}" != "$TAG" ] && [ "$SGDK_SHA" = "$master_head" ]; then
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --latest
+          if [ -n "$rid" ]; then
+            # Existing release: refresh title/notes only. draft/make_latest are deliberately NOT
+            # touched, so backfilling an already-published release never un-publishes it.
+            gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$rid" \
+              -f name="$TITLE" -f body="$NOTES" >/dev/null
           else
-            gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --latest=false
+            # A NEW release starts as a DRAFT; the finalize job publishes it once all five
+            # platform bundles are attached. Listing order is unaffected: a release's created_at
+            # is the tagged commit's date, not the publish time -- the same property the dated
+            # empty commit above relies on to keep the Releases page chronological.
+            rid="$(gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
+                     -f tag_name="$TAG" -f name="$TITLE" -f body="$NOTES" \
+                     -F draft=true --jq '.id')"
           fi
+          echo "release_id=$rid" >> "$GITHUB_OUTPUT"
 
   build:
     name: ${{ matrix.name }}
@@ -408,7 +421,28 @@ jobs:
       - name: Upload to release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ inputs.release_tag }}" "${{ steps.pkg.outputs.asset || steps.pkgwin.outputs.asset }}" --clobber --repo "${{ github.repository }}"
+          RELEASE_ID: ${{ needs.release.outputs.release_id }}
+          ASSET: ${{ steps.pkg.outputs.asset || steps.pkgwin.outputs.asset }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Addressed by release id, never by tag: the release is a draft until finalize
+          # publishes it, and GET /releases/tags/<tag> does not return drafts. `gh release
+          # upload <tag>` has a GraphQL fallback for that, but it is reported to fail with the
+          # Actions token, so the id avoids the question. This replaces --clobber: drop a
+          # same-named asset left by an earlier run, then POST the tarball.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" \
+            --jq '.[] | "\(.name)\t\(.id)"' \
+          | awk -F'\t' -v n="$ASSET" '$1 == n { print $2 }' \
+          | while read -r aid; do
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$aid"
+            done
+          curl -fsSL --retry 3 -X POST -o /dev/null \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/gzip" \
+            --data-binary @"$ASSET" \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$ASSET"
 
   # Docs are platform-independent: generate ONCE and ship as a separate asset
   # (sgdkx downloads it instead of running doxygen locally). Recipe mirrors sgdkx's
@@ -461,4 +495,80 @@ jobs:
         if: steps.pkg.outputs.asset != ''
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ inputs.release_tag }}" "${{ steps.pkg.outputs.asset }}" --clobber --repo "${{ github.repository }}"
+          RELEASE_ID: ${{ needs.release.outputs.release_id }}
+          ASSET: ${{ steps.pkg.outputs.asset }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Addressed by release id, never by tag: the release is a draft until finalize
+          # publishes it, and GET /releases/tags/<tag> does not return drafts. `gh release
+          # upload <tag>` has a GraphQL fallback for that, but it is reported to fail with the
+          # Actions token, so the id avoids the question. This replaces --clobber: drop a
+          # same-named asset left by an earlier run, then POST the tarball.
+          gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets" \
+            --jq '.[] | "\(.name)\t\(.id)"' \
+          | awk -F'\t' -v n="$ASSET" '$1 == n { print $2 }' \
+          | while read -r aid; do
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$aid"
+            done
+          curl -fsSL --retry 3 -X POST -o /dev/null \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/gzip" \
+            --data-binary @"$ASSET" \
+            "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID/assets?name=$ASSET"
+
+  # Publish gate. The release stays a DRAFT until every platform bundle is attached: drafts are
+  # absent from the unauthenticated /releases listing, so a run that loses one platform -- e.g. a
+  # macOS job that never gets a hosted runner -- cannot expose a release that 404s for it.
+  # sgdkx resolves `--version master` by walking that listing and taking the first master-* tag
+  # (release.rs latest_master_tag), then downloading sgdk-<tag>-<platform>.tar.gz directly, so a
+  # published-but-incomplete release breaks exactly the platform whose build failed. sync.yml's
+  # discover re-plans any release that is draft or missing an asset, and this job publishes it.
+  finalize:
+    name: publish when complete
+    needs: [release, build, docs]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish the release once every platform asset is present
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ inputs.release_tag }}"
+          REF="${{ inputs.sgdk_ref }}"
+          RID="${{ needs.release.outputs.release_id }}"
+          if [ -z "$RID" ]; then
+            echo "::error::the release job produced no release id -- nothing to publish"
+            exit 1
+          fi
+
+          # Keep this platform list in step with the one sync.yml's discover uses to decide which
+          # existing releases are incomplete and need a backfill build. Docs are NOT required:
+          # old SGDK versions ship no doxyconfig, so that asset is legitimately absent.
+          have="$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases/$RID/assets" --jq '.[].name')"
+          missing=""
+          for p in linux-x86_64 linux-arm64 macos-arm64 macos-x86_64 windows-x86_64; do
+            grep -qxF "sgdk-$TAG-$p.tar.gz" <<<"$have" || missing="$missing $p"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::$TAG stays a draft -- missing platform bundle(s):$missing"
+            exit 1
+          fi
+
+          # Complete: publish AND decide the "Latest" badge in one request, so the release is never
+          # briefly Latest with the wrong value. Only the master build whose commit IS the current
+          # SGDK master HEAD may take it; version tags and OLD-master backfills (built later by
+          # wall-clock) must never grab it.
+          SGDK_SHA="$(gh api "repos/${SGDK_REPO}/commits/${REF}" --jq '.sha')"
+          master_head="$(gh api "repos/${SGDK_REPO}/commits/master" --jq '.sha')"
+          if [ "${TAG#master-}" != "$TAG" ] && [ "$SGDK_SHA" = "$master_head" ]; then
+            latest=true
+          else
+            latest=false
+          fi
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RID" \
+            -F draft=false -f make_latest="$latest" >/dev/null
+          echo "published $TAG (make_latest=$latest)"

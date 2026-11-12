@@ -10,11 +10,12 @@ name: sync
 #      master-<sha>. This captures intermediate master states between cron runs without
 #      rebuilding commits that don't change the bundle (docs, samples, .bat, etc.). We do NOT
 #      backfill history before the baseline — only commits newer than what we've built.
-#   4. Any EXISTING release missing a platform asset (so releases cut before a platform
-#      existed — e.g. windows — get backfilled).
-# Builds the gaps by calling build.yml (workflow_call); build.yml's --clobber upload fills in
-# only the missing platforms. Any other commit is built on-demand via build.yml's
-# workflow_dispatch.
+#   4. Any EXISTING release that is still a draft or missing a platform asset (so releases cut
+#      before a platform existed — e.g. windows — get backfilled, and a release left unpublished
+#      by a failed finalize gets another chance to be published).
+# Builds the gaps by calling build.yml (workflow_call); build.yml replaces a same-named asset,
+# so a rebuild fills in only what was missing. Any other commit is built on-demand via
+# build.yml's workflow_dispatch.
 
 on:
   workflow_dispatch:
@@ -70,12 +71,17 @@ jobs:
 
           # releases that already exist in THIS repo
           existing=$(gh release list --repo "${GITHUB_REPOSITORY}" --limit 1000 --json tagName --jq '.[].tagName' || true)
-          # EXISTING releases missing >=1 platform bundle (sgdk-<tag>-<platform>.tar.gz) — one API
-          # call; jq flags any release whose assets don't cover all 5 platforms (backfill targets).
+          # EXISTING releases that are not DONE (backfill targets) — one API call. A release is
+          # done only when it is published AND its assets cover all 5 platform bundles
+          # (sgdk-<tag>-<platform>.tar.gz). Still a draft counts as not done, which also recovers
+          # a release whose builds all passed but whose build.yml finalize job failed to publish:
+          # rebuilding it re-runs finalize. Drafts are visible here because this call is
+          # authenticated; unauthenticated clients never see them, which is the point.
           incomplete=$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '
             .[] | .tag_name as $t | (.assets | map(.name)) as $have
-            | if (["linux-x86_64","linux-arm64","macos-arm64","macos-x86_64","windows-x86_64"]
-                  | all(. as $p | $have | index("sgdk-\($t)-\($p).tar.gz")))
+            | if ((.draft | not)
+                  and (["linux-x86_64","linux-arm64","macos-arm64","macos-x86_64","windows-x86_64"]
+                       | all(. as $p | $have | index("sgdk-\($t)-\($p).tar.gz"))))
               then empty else $t end' || true)
 
           # --- FORWARD-ONLY path-filtered master commit coverage ---
